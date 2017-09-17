@@ -1,4 +1,5 @@
-/build*
 /files*
 
+.sha256sums.current
+*.out
 *.py[cdo]
