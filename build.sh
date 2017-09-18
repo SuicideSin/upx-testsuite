@@ -1,18 +1,37 @@
 #! /bin/bash
 ## vim:set ts=4 sw=4 et:
 set -e; set -o pipefail
+
+# Create test files for the UPX test suite.
+# Copyright (C) Markus Franz Xaver Johannes Oberhumer
+
 #set -x # debug
 umask 022
 argv0=$0; argv0abs=$(readlink -en -- "$0"); argv0dir=$(dirname "$argv0abs")
 
 #
-# required unpacked files:
+# Required unpacked files:
 #
 #   https://github.com/upx/upx-stubtools/releases/download/v20160918/bin-upx-20160918.tar.xz
 #   https://github.com/upx/upx-stubtools/releases/download/v20160918/upx-linux-musl-gcc-7.2.0-toolchains-20170914.tar.xz
 #
-#  WARNING: these are rather huge archives and require > 10 GiB of disk space when unpacked
+# It is preferred to use the /usr/local/bin/upx-linux-musl-gcc-7.2.0-toolchains-20170914
+# directory or symlink for installation so that dynamic loading and execution of the
+# created binaries on your local machine works (also see "fixed_prefix") below.
 #
+# WARNING: these are rather huge archives and require a total of > 10 GiB of disk space when unpacked
+#
+
+
+check_sha256sums() {
+    (cd files/unpacked && sha256sum -b */upx_test* | LC_ALL=C sort -k2) > .sha256sums.current
+    if ! cmp -s .sha256sums.expected .sha256sums.current; then
+        echo "UPX-ERROR: $1 FAILED: checksum mismatch"
+        diff -u .sha256sums.expected .sha256sums.current || true
+        exit 1
+    fi
+}
+
 
 search_dir() {
     local subdir="$1"
@@ -27,11 +46,13 @@ search_dir() {
 }
 
 
-# set gcc, gxx, dynlink_flags, rpath_flags
+# sets: gcc, gxx, dynlink_flags, rpath_flags
+# uses: d_toolchains, tc, dynlink_name
 set_gcc() {
+    local mode=$1
     local x fixed_prefix
     x=linux-musl-gcc-7.2.0-20170914/$tc-gcc-7.2.0
-    if [[ $1 == pie ]]; then
+    if [[ $mode == pie ]]; then
         x=linux-musl-gcc-7.2.0-20170914-default-pie/$tc-gcc-7.2.0
     fi
     gcc=$d_toolchains/$x/bin/$tc-gcc
@@ -43,7 +64,8 @@ set_gcc() {
     # NOTE: to ensure reproducibility we set a fixed dynamic linker and rpath in /usr/local/bin
     fixed_prefix=/usr/local/bin/upx-linux-musl-gcc-7.2.0-toolchains-20170914
     dynlink_flags="-Wl,--dynamic-linker=$fixed_prefix/$x/$tc/lib/$dynlink_name"
-    rpath_flags="-Wl,--rpath=$fixed_prefix/$x/$tc/lib"
+    rpath_flags="-Wl,-rpath=$fixed_prefix/$x/$tc/lib"
+    rpath_flags="$rpath_flags -Wl,-rpath=\$ORIGIN"
 }
 
 
@@ -55,15 +77,15 @@ run_gcc() {
 
 build_arch() {
     local src_c src_x odir oprefix tc dynlink_name
-    local gcc gxx cppflags cflags cxxflags ldflags libs clibs cxxlibs
-    local x
+    local gcc gxx cppflags cflags cxxflags ldflags libs libs_c libs_x
+    local o x
 
     printf "===== %-10s  %-22s  %s\n" $1 $2 $3
 
+    oprefix=$1
     src_c=src/$1_c*.c
     src_x=src/$1_x*.cpp
     odir=files/unpacked/$2
-    oprefix=$odir/$1
     tc=$3
     dynlink_name=$4
     shift 4
@@ -74,36 +96,50 @@ build_arch() {
 
     mkdir -p $odir
 
-    cflags="-pthread -O2 -Wall -W -Wcast-align -Wcast-qual -pedantic"
+    cppflags="-DMUSL -DDLL_PREFIX=\"$oprefix\""
+    cflags="-pthread -O2 -Wall -W -Wcast-align -Wcast-qual -Wshadow -pedantic"
     cxxflags="$cflags"
     ldflags="-s -Wl,--build-id=none"
 
+    #libs_c="-L$odir -l${oprefix}_dll_c"
+    libs_c="-DUSE_DLOPEN"
+    libs_x="-L$odir -l${oprefix}_dll_x"
+
+    o=$odir/$oprefix
+
     set_gcc default
 
-    # dll
-    x="$1 -shared -fPIC $dynlink_flags $rpath_flags"
-    run_gcc $gcc $x $cppflags $cflags   $ldflags -DDLL -o ${oprefix}_dll_c.so $src_c $libs $clibs
-    run_gcc $gxx $x $cppflags $cxxflags $ldflags -DDLL -o ${oprefix}_dll_x.so $src_x $libs $cxxlibs
+    # dll (-fPIC)
+    x="$1 -DDLL -shared -fPIC $dynlink_flags $rpath_flags"
+    run_gcc $gcc $x $cppflags $cflags   $ldflags -o ${odir}/lib${oprefix}_dll_c.so $src_c $libs
+    run_gcc $gxx $x $cppflags $cxxflags $ldflags -o ${odir}/lib${oprefix}_dll_x.so $src_x $libs
+
+    # exe (-fPIC)
+    x="$1 -fPIC $dynlink_flags $rpath_flags"
+    run_gcc $gcc $x $cppflags $cflags   $ldflags -o ${o}_exe_dynamic_pic_c.out $src_c $libs_c $libs
+    run_gcc $gxx $x $cppflags $cxxflags $ldflags -o ${o}_exe_dynamic_pic_x.out $src_x $libs_x $libs
 
     # exe
     x="$1 $dynlink_flags $rpath_flags"
-    run_gcc $gcc $x $cppflags $cflags   $ldflags -o ${oprefix}_exe_dynamic_nopie_c.out $src_c $libs $clibs
-    run_gcc $gxx $x $cppflags $cxxflags $ldflags -o ${oprefix}_exe_dynamic_nopie_x.out $src_x $libs $cxxlibs
+    run_gcc $gcc $x $cppflags $cflags   $ldflags -o ${o}_exe_dynamic_nopie_c.out $src_c $libs_c $libs
+    run_gcc $gxx $x $cppflags $cxxflags $ldflags -o ${o}_exe_dynamic_nopie_x.out $src_x $libs_x $libs
+
     # static exe
-    x="$1 -static"
-    run_gcc $gcc $x $cppflags $cflags   $ldflags -o ${oprefix}_exe_static_nopie_c.out $src_c $libs $clibs
-    run_gcc $gxx $x $cppflags $cxxflags $ldflags -o ${oprefix}_exe_static_nopie_x.out $src_x $libs $cxxlibs
+    x="$1 -DSTATIC -static"
+    run_gcc $gcc $x $cppflags $cflags   $ldflags -o ${o}_exe_static_nopie_c.out $src_c $libs
+    run_gcc $gxx $x $cppflags $cxxflags $ldflags -o ${o}_exe_static_nopie_x.out $src_x $libs
 
     set_gcc pie
 
     # exe (-fPIE via --enable-default-pie toolchain)
     x="$1 $dynlink_flags $rpath_flags"
-    run_gcc $gcc $x $cppflags $cflags   $ldflags -o ${oprefix}_exe_dynamic_pie_c.out $src_c $libs $clibs
-    run_gcc $gxx $x $cppflags $cxxflags $ldflags -o ${oprefix}_exe_dynamic_pie_x.out $src_x $libs $cxxlibs
+    run_gcc $gcc $x $cppflags $cflags   $ldflags -o ${o}_exe_dynamic_pie_c.out $src_c $libs_c $libs
+    run_gcc $gxx $x $cppflags $cxxflags $ldflags -o ${o}_exe_dynamic_pie_x.out $src_x $libs_x $libs
+
     # static exe (-fPIE via --enable-default-pie toolchain)
-    x="$1 -static"
-    run_gcc $gcc $x $cppflags $cflags   $ldflags -o ${oprefix}_exe_static_pie_c.out $src_c $libs $clibs
-    run_gcc $gxx $x $cppflags $cxxflags $ldflags -o ${oprefix}_exe_static_pie_x.out $src_x $libs $cxxlibs
+    x="$1 -DSTATIC -static"
+    run_gcc $gcc $x $cppflags $cflags   $ldflags -o ${o}_exe_static_pie_c.out $src_c $libs
+    run_gcc $gxx $x $cppflags $cxxflags $ldflags -o ${o}_exe_static_pie_x.out $src_x $libs
 }
 
 
@@ -162,13 +198,7 @@ main() {
 
     build upx_test01
 
-    (cd files/unpacked && sha256sum -b */upx_test* | LC_ALL=C sort -k2) > .sha256sums.current
-    if ! cmp -s .sha256sums.expected .sha256sums.current; then
-        echo "UPX-ERROR: $1 FAILED: checksum mismatch"
-        diff -u .sha256sums.expected .sha256sums.current || true
-        exit 1
-    fi
-
+    check_sha256sums
     echo "UPX test files built. All done."
 }
 
